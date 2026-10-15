@@ -1,0 +1,27 @@
+name: CI
+
+# Typecheck, rebuild dist/, and fail if the committed dist/ is stale. Consumers
+# install this repo as a git dependency by SHA and run no build step, so dist/
+# is what they import.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    name: typecheck · dist · tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run typecheck
+      - name: dist/ is up to date (run `npm run build` and commit if this fails)
+        run: npm run check:dist
+      - run: npm test
