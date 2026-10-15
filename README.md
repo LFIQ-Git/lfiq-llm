@@ -23,6 +23,10 @@ These match the `lfiq` rows of `ai.routes` (brick.command migration 227), which 
 
 A free model replaces a paid one for a task only after it wins or ties at least 8 of 10 blind comparisons with no factual errors.
 
+## Route table and run log (0.3.0)
+
+Set `AI_CONTROL_URL` (`https://brickston-backend.fly.dev`) and `AI_CONTROL_SECRET` (the backend's scheduler secret). Routes then come from the lfiq rows of `ai.routes`, the AI Console Models page, cached 60 s. Every call is also written to `ai.runs`. An OCP row in the table is ignored. If the table can't be read, the built-in tiers below apply.
+
 ## Overrides
 
 `AI_ROUTE_<TASK>` replaces the route for one task. The task key is uppercased, with dots turned into underscores:
@@ -64,6 +68,7 @@ Every attempt logs one `llm.call` JSON line, with fields matching the `ai.runs` 
 |---|---|
 | `ANTHROPIC_API_KEY` | Anthropic leg |
 | `AI_ROUTE_<TASK>` | Per-task route override |
+| `AI_CONTROL_URL`, `AI_CONTROL_SECRET` | Route table and run log (0.3.0) |
 
 The Workers AI leg uses the Worker's `AI` binding (`[ai] binding = "AI"` in wrangler), registered with `setWorkersAi`.
 

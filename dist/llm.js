@@ -64,20 +64,90 @@ export function parseRoute(spec) {
         return { provider, model };
     });
 }
-/** The legs a task will try, in order. */
-export function resolveRoute(task, tier) {
+const CTL_KEY = "__lfiqLlmControl";
+function ctl() {
+    return (G[CTL_KEY] ??= (G[CTL_KEY] = { at: 0, routes: null, inflight: null, queue: [] }));
+}
+const ROUTE_TTL_MS = 60_000;
+const CONTROL_TIMEOUT_MS = 2_000;
+function control() {
+    const url = env("AI_CONTROL_URL")?.replace(/\/$/, "");
+    const secret = env("AI_CONTROL_SECRET");
+    return url && secret ? { url, headers: { "x-scheduler-secret": secret, "content-type": "application/json" } } : null;
+}
+/** Refresh the lfiq route table when older than 60 s. Never throws. */
+export async function refreshRoutes(force = false) {
+    const c = control();
+    const state = ctl();
+    if (!c)
+        return;
+    if (!force && Date.now() - state.at < ROUTE_TTL_MS)
+        return;
+    if (state.inflight)
+        return state.inflight;
+    state.inflight = (async () => {
+        try {
+            const r = await fetch(`${c.url}/api/v1/ai/config?router=lfiq`, { headers: c.headers, signal: AbortSignal.timeout(CONTROL_TIMEOUT_MS) });
+            if (r.ok) {
+                const j = (await r.json());
+                if (Array.isArray(j.routes))
+                    state.routes = j.routes;
+            }
+        }
+        catch {
+            /* keep the previous table */
+        }
+        finally {
+            state.at = Date.now();
+            state.inflight = null;
+        }
+    })();
+    return state.inflight;
+}
+function tableLeg(l) {
+    const provider = l.provider === "workers_ai" ? "workers-ai" : l.provider;
+    return provider === "workers-ai" || provider === "anthropic" ? { provider, model: l.model } : null;
+}
+/** The legs a task will try, in order: AI_ROUTE_<TASK>, the ai.routes table, then ROUTES. */
+export async function resolveRoute(task, tier) {
     const override = env(taskEnvName(task));
     if (override)
         return parseRoute(override);
+    await refreshRoutes();
+    const routes = ctl().routes;
+    if (routes) {
+        const route = routes.find((r) => r.task === task) ?? routes.find((r) => r.task === null && r.tier === tier);
+        if (route) {
+            const legs = [route.primary, ...(route.fallback ? [route.fallback] : [])].map(tableLeg).filter((l) => l !== null);
+            if (legs.length)
+                return legs;
+        }
+    }
     const legs = ROUTES[tier];
     if (!legs)
         throw new Error(`unknown tier "${tier}"`);
     return legs;
 }
+/** Send queued runs to ai.runs. Awaited at the end of every call (2 s cap). Never throws. */
+export async function flushRuns() {
+    const c = control();
+    const state = ctl();
+    if (!c || state.queue.length === 0)
+        return;
+    const batch = state.queue.splice(0, 100);
+    try {
+        await fetch(`${c.url}/api/v1/ai/runs`, { method: "POST", headers: c.headers, body: JSON.stringify({ runs: batch }), signal: AbortSignal.timeout(CONTROL_TIMEOUT_MS) });
+    }
+    catch {
+        /* dropped: logging never fails a call */
+    }
+}
 /** True when this task has at least one usable leg right now. */
 export function llmConfigured(task = "", tier = "fast") {
     try {
-        return resolveRoute(task || "any.task", tier).some((leg) => legAvailable(leg));
+        const override = task ? env(taskEnvName(task)) : undefined;
+        const legs = override ? parseRoute(override) : ROUTES[tier];
+        return legs.some((leg) => legAvailable(leg));
     }
     catch {
         return false;
@@ -208,6 +278,12 @@ function appName(task) {
 }
 async function record(rec) {
     console.log(JSON.stringify({ event: "llm.call", ...rec }));
+    if (control()) {
+        const q = ctl().queue;
+        q.push(rec);
+        if (q.length > 500)
+            q.splice(0, q.length - 500);
+    }
     const hook = G[RUN_KEY];
     if (!hook)
         return;
@@ -221,30 +297,35 @@ async function record(rec) {
 async function runLegs(args, call) {
     if (!TASK_PATTERN.test(args.task))
         throw new Error(`task key "${args.task}" must be app.task in lowercase`);
-    const legs = resolveRoute(args.task, args.tier);
+    const legs = await resolveRoute(args.task, args.tier);
     const errors = [];
-    for (let i = 0; i < legs.length; i++) {
-        const leg = legs[i];
-        const fellBack = i > 0;
-        const base = { router: "lfiq", app: appName(args.task), task: args.task, tier: args.tier, provider: leg.provider, model: leg.model };
-        if (!legAvailable(leg)) {
-            errors.push(`${leg.provider}: not configured`);
-            continue;
+    try {
+        for (let i = 0; i < legs.length; i++) {
+            const leg = legs[i];
+            const fellBack = i > 0;
+            const base = { router: "lfiq", app: appName(args.task), task: args.task, tier: args.tier, provider: leg.provider, model: leg.model };
+            if (!legAvailable(leg)) {
+                errors.push(`${leg.provider}: not configured`);
+                continue;
+            }
+            const t0 = Date.now();
+            try {
+                const out = await withTimeout(call(leg), args.timeoutMs ?? 60_000, `${leg.provider} ${leg.model}`);
+                const latencyMs = Date.now() - t0;
+                await record({ ...base, input_tokens: out.usage.input_tokens, output_tokens: out.usage.output_tokens, latency_ms: latencyMs, fell_back: fellBack, ok: true });
+                return { out, leg, fellBack, latencyMs };
+            }
+            catch (e) {
+                const msg = redact(e);
+                errors.push(`${leg.provider}: ${msg}`);
+                await record({ ...base, latency_ms: Date.now() - t0, fell_back: fellBack, ok: false, error: msg });
+            }
         }
-        const t0 = Date.now();
-        try {
-            const out = await withTimeout(call(leg), args.timeoutMs ?? 60_000, `${leg.provider} ${leg.model}`);
-            const latencyMs = Date.now() - t0;
-            await record({ ...base, input_tokens: out.usage.input_tokens, output_tokens: out.usage.output_tokens, latency_ms: latencyMs, fell_back: fellBack, ok: true });
-            return { out, leg, fellBack, latencyMs };
-        }
-        catch (e) {
-            const msg = redact(e);
-            errors.push(`${leg.provider}: ${msg}`);
-            await record({ ...base, latency_ms: Date.now() - t0, fell_back: fellBack, ok: false, error: msg });
-        }
+        throw new Error(`all LFIQ router legs failed for ${args.task}: ${errors.join(" | ")}`);
     }
-    throw new Error(`all LFIQ router legs failed for ${args.task}: ${errors.join(" | ")}`);
+    finally {
+        await flushRuns();
+    }
 }
 /** Free-text answer. */
 export async function chat(args) {

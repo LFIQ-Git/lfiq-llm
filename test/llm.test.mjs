@@ -64,16 +64,16 @@ test("source has no OCP code path", async () => {
   assert.doesNotMatch(code, /OCP_|ocp\.lfiq|"ocp"/i);
 });
 
-test("an OCP leg in an override is refused", () => {
+test("an OCP leg in an override is refused", async () => {
   assert.throws(() => parseRoute("ocp:claude-sonnet-5-5"), /not allowed on the LFIQ router/);
   process.env.AI_ROUTE_PURSUE_BRIEF = "ocp:claude-sonnet-5-5";
-  assert.throws(() => resolveRoute("pursue.brief", "standard"), /not allowed/);
+  await assert.rejects(resolveRoute("pursue.brief", "standard"), /not allowed/);
 });
 
-test("per-task env override replaces the tier route", () => {
+test("per-task env override replaces the tier route", async () => {
   assert.equal(taskEnvName("pursue.competitor_study"), "AI_ROUTE_PURSUE_COMPETITOR_STUDY");
   process.env.AI_ROUTE_PURSUE_BRIEF = "workers-ai:@cf/openai/gpt-oss-120b, anthropic:claude-sonnet-5-5";
-  assert.deepEqual(resolveRoute("pursue.brief", "standard"), [
+  assert.deepEqual(await resolveRoute("pursue.brief", "standard"), [
     { provider: "workers-ai", model: "@cf/openai/gpt-oss-120b" },
     { provider: "anthropic", model: "claude-sonnet-5-5" },
   ]);
@@ -195,4 +195,36 @@ test("a slow leg times out and the next leg answers", async () => {
   const r = await chat({ ...ARGS, timeoutMs: 50 });
   assert.equal(r.provider, "anthropic");
   assert.match(runs[0].error, /timed out/);
+});
+
+test("with the control plane set, the lfiq table picks the route and runs are posted", async () => {
+  delete globalThis.__lfiqLlmControl;
+  process.env.AI_CONTROL_URL = "https://backend.test/";
+  process.env.AI_CONTROL_SECRET = "sched";
+  process.env.ANTHROPIC_API_KEY = "sk-test-0000000000";
+  const posted = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url);
+    if (u.startsWith("https://backend.test/api/v1/ai/config")) {
+      assert.equal(init.headers["x-scheduler-secret"], "sched");
+      return new Response(JSON.stringify({ routes: [
+        { tier: "standard", task: null, primary: { provider: "anthropic", model: "claude-sonnet-5-5" }, fallback: null },
+        { tier: "standard", task: "pursue.brief", primary: { provider: "workers_ai", model: "@cf/openai/gpt-oss-120b" }, fallback: { provider: "anthropic", model: "claude-sonnet-5-5" } },
+        { tier: "fast", task: null, primary: { provider: "ocp", model: "claude-haiku-4-5" }, fallback: null },
+      ] }), { status: 200 });
+    }
+    if (u === "https://backend.test/api/v1/ai/runs") { posted.push(...JSON.parse(init.body).runs); return new Response("{}", { status: 201 }); }
+    anthropicCalls.push({ body: JSON.parse(init.body) });
+    return new Response(JSON.stringify({ content: [{ type: "text", text: "paid" }], stop_reason: "end_turn", usage: { input_tokens: 5, output_tokens: 2 } }), { status: 200 });
+  };
+  setWorkersAi(aiBinding({ choices: [{ message: { content: "free" } }] }));
+  const r = await chat({ ...ARGS, task: "pursue.brief", tier: "standard" });
+  assert.equal(r.text, "free");
+  assert.equal(r.provider, "workers-ai");
+  assert.deepEqual(await resolveRoute("pursue.study", "fast"), ROUTES.fast, "an OCP row in the table is ignored on the LFIQ router");
+  assert.equal(posted.length, 1);
+  assert.equal(posted[0].task, "pursue.brief");
+  delete process.env.AI_CONTROL_URL;
+  delete process.env.AI_CONTROL_SECRET;
+  delete globalThis.__lfiqLlmControl;
 });

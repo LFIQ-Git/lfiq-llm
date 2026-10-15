@@ -147,19 +147,108 @@ export function parseRoute(spec: string): RouteLeg[] {
   });
 }
 
-/** The legs a task will try, in order. */
-export function resolveRoute(task: string, tier: Tier): RouteLeg[] {
+/* ---------------------------------------------------------- control plane */
+
+// With AI_CONTROL_URL (brickston-backend) and AI_CONTROL_SECRET (its scheduler
+// secret) set, routes come from GET /api/v1/ai/config?router=lfiq (the lfiq rows
+// of ai.routes, cached 60 s) and every call is appended to ai.runs. Any failure
+// falls back to the built-in ROUTES and never fails a call.
+
+interface TableLeg {
+  provider: string;
+  model: string;
+}
+interface TableRoute {
+  tier: string;
+  task: string | null;
+  primary: TableLeg;
+  fallback: TableLeg | null;
+}
+interface Control {
+  at: number;
+  routes: TableRoute[] | null;
+  inflight: Promise<void> | null;
+  queue: RunRecord[];
+}
+const CTL_KEY = "__lfiqLlmControl";
+function ctl(): Control {
+  return ((G[CTL_KEY] as Control | undefined) ??= (G[CTL_KEY] = { at: 0, routes: null, inflight: null, queue: [] }) as Control);
+}
+const ROUTE_TTL_MS = 60_000;
+const CONTROL_TIMEOUT_MS = 2_000;
+
+function control(): { url: string; headers: Record<string, string> } | null {
+  const url = env("AI_CONTROL_URL")?.replace(/\/$/, "");
+  const secret = env("AI_CONTROL_SECRET");
+  return url && secret ? { url, headers: { "x-scheduler-secret": secret, "content-type": "application/json" } } : null;
+}
+
+/** Refresh the lfiq route table when older than 60 s. Never throws. */
+export async function refreshRoutes(force = false): Promise<void> {
+  const c = control();
+  const state = ctl();
+  if (!c) return;
+  if (!force && Date.now() - state.at < ROUTE_TTL_MS) return;
+  if (state.inflight) return state.inflight;
+  state.inflight = (async () => {
+    try {
+      const r = await fetch(`${c.url}/api/v1/ai/config?router=lfiq`, { headers: c.headers, signal: AbortSignal.timeout(CONTROL_TIMEOUT_MS) });
+      if (r.ok) {
+        const j = (await r.json()) as { routes?: TableRoute[] };
+        if (Array.isArray(j.routes)) state.routes = j.routes;
+      }
+    } catch {
+      /* keep the previous table */
+    } finally {
+      state.at = Date.now();
+      state.inflight = null;
+    }
+  })();
+  return state.inflight;
+}
+
+function tableLeg(l: TableLeg): RouteLeg | null {
+  const provider = l.provider === "workers_ai" ? "workers-ai" : l.provider;
+  return provider === "workers-ai" || provider === "anthropic" ? { provider, model: l.model } : null;
+}
+
+/** The legs a task will try, in order: AI_ROUTE_<TASK>, the ai.routes table, then ROUTES. */
+export async function resolveRoute(task: string, tier: Tier): Promise<RouteLeg[]> {
   const override = env(taskEnvName(task));
   if (override) return parseRoute(override);
+  await refreshRoutes();
+  const routes = ctl().routes;
+  if (routes) {
+    const route = routes.find((r) => r.task === task) ?? routes.find((r) => r.task === null && r.tier === tier);
+    if (route) {
+      const legs = [route.primary, ...(route.fallback ? [route.fallback] : [])].map(tableLeg).filter((l): l is RouteLeg => l !== null);
+      if (legs.length) return legs;
+    }
+  }
   const legs = ROUTES[tier];
   if (!legs) throw new Error(`unknown tier "${tier}"`);
   return legs;
 }
 
+/** Send queued runs to ai.runs. Awaited at the end of every call (2 s cap). Never throws. */
+export async function flushRuns(): Promise<void> {
+  const c = control();
+  const state = ctl();
+  if (!c || state.queue.length === 0) return;
+  const batch = state.queue.splice(0, 100);
+  try {
+    await fetch(`${c.url}/api/v1/ai/runs`, { method: "POST", headers: c.headers, body: JSON.stringify({ runs: batch }), signal: AbortSignal.timeout(CONTROL_TIMEOUT_MS) });
+  } catch {
+    /* dropped: logging never fails a call */
+  }
+}
+
 /** True when this task has at least one usable leg right now. */
 export function llmConfigured(task = "", tier: Tier = "fast"): boolean {
   try {
-    return resolveRoute(task || "any.task", tier).some((leg) => legAvailable(leg));
+    const override = task ? env(taskEnvName(task)) : undefined;
+    const legs = override ? parseRoute(override) : ROUTES[tier];
+    return legs.some((leg) => legAvailable(leg));
   } catch {
     return false;
   }
@@ -318,6 +407,11 @@ function appName(task: string): string {
 
 async function record(rec: RunRecord): Promise<void> {
   console.log(JSON.stringify({ event: "llm.call", ...rec }));
+  if (control()) {
+    const q = ctl().queue;
+    q.push(rec);
+    if (q.length > 500) q.splice(0, q.length - 500);
+  }
   const hook = G[RUN_KEY] as ((r: RunRecord) => void | Promise<void>) | undefined;
   if (!hook) return;
   try {
@@ -332,8 +426,9 @@ async function runLegs<T extends LegOutput>(
   call: (leg: RouteLeg) => Promise<T>,
 ): Promise<{ out: T; leg: RouteLeg; fellBack: boolean; latencyMs: number }> {
   if (!TASK_PATTERN.test(args.task)) throw new Error(`task key "${args.task}" must be app.task in lowercase`);
-  const legs = resolveRoute(args.task, args.tier);
+  const legs = await resolveRoute(args.task, args.tier);
   const errors: string[] = [];
+  try {
   for (let i = 0; i < legs.length; i++) {
     const leg = legs[i];
     const fellBack = i > 0;
@@ -355,6 +450,9 @@ async function runLegs<T extends LegOutput>(
     }
   }
   throw new Error(`all LFIQ router legs failed for ${args.task}: ${errors.join(" | ")}`);
+  } finally {
+    await flushRuns();
+  }
 }
 
 /** Free-text answer. */

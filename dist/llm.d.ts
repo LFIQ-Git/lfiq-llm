@@ -91,8 +91,12 @@ export declare function onRun(hook: ((rec: RunRecord) => void | Promise<void>) |
 export declare function taskEnvName(task: string): string;
 /** Parse "provider:model,provider:model". Unknown providers (including ocp) are refused. */
 export declare function parseRoute(spec: string): RouteLeg[];
-/** The legs a task will try, in order. */
-export declare function resolveRoute(task: string, tier: Tier): RouteLeg[];
+/** Refresh the lfiq route table when older than 60 s. Never throws. */
+export declare function refreshRoutes(force?: boolean): Promise<void>;
+/** The legs a task will try, in order: AI_ROUTE_<TASK>, the ai.routes table, then ROUTES. */
+export declare function resolveRoute(task: string, tier: Tier): Promise<RouteLeg[]>;
+/** Send queued runs to ai.runs. Awaited at the end of every call (2 s cap). Never throws. */
+export declare function flushRuns(): Promise<void>;
 /** True when this task has at least one usable leg right now. */
 export declare function llmConfigured(task?: string, tier?: Tier): boolean;
 /**
