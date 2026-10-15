@@ -124,37 +124,72 @@ async function callWorkersAi(model, args, json) {
         throw new Error(`workers-ai returned no text (${model})`);
     return { text: text.trim(), usage: { input_tokens: raw?.usage?.prompt_tokens, output_tokens: raw?.usage?.completion_tokens } };
 }
-async function callAnthropic(model, args, tool) {
+// Headroom for models whose thinking cannot be turned off; thinking tokens count against max_tokens.
+const THINKING_HEADROOM = 4096;
+/**
+ * Per-model request settings. Thinking tokens count against max_tokens, so a
+ * model that thinks by default needs thinking off or extra room, or the answer
+ * is cut short.
+ *   - claude-haiku-4-*: no thinking by default; sampling settings allowed.
+ *   - claude-sonnet-5-5: thinks by default; `between_tools` turns it off.
+ *   - other current models (Opus 5.5 etc.): thinking always on; low effort plus headroom.
+ */
+export function anthropicSettings(model, maxTokens, temperature) {
+    if (model.startsWith("claude-haiku-4")) {
+        return { max_tokens: maxTokens, ...(temperature !== undefined ? { temperature } : {}) };
+    }
+    if (model === "claude-sonnet-5-5") {
+        return { max_tokens: maxTokens, thinking: { type: "between_tools" } };
+    }
+    return { max_tokens: maxTokens + THINKING_HEADROOM, output_config: { effort: "low" } };
+}
+/** Structured outputs need additionalProperties: false on every object. */
+export function strictSchema(schema) {
+    if (Array.isArray(schema))
+        return schema.map(strictSchema);
+    if (!schema || typeof schema !== "object")
+        return schema;
+    const out = {};
+    for (const [k, v] of Object.entries(schema)) {
+        out[k] = k === "properties" && v && typeof v === "object"
+            ? Object.fromEntries(Object.entries(v).map(([pk, pv]) => [pk, strictSchema(pv)]))
+            : strictSchema(v);
+    }
+    const t = out.type;
+    if ((t === "object" || (Array.isArray(t) && t.includes("object"))) && !("additionalProperties" in out)) {
+        out.additionalProperties = false;
+    }
+    return out;
+}
+async function callAnthropic(model, args, json) {
     const key = env("ANTHROPIC_API_KEY");
     if (!key)
         throw new Error("ANTHROPIC_API_KEY not set");
+    const settings = anthropicSettings(model, args.maxTokens ?? 1024, args.temperature);
+    const outputConfig = {
+        ...(settings.output_config ?? {}),
+        ...(json ? { format: { type: "json_schema", schema: strictSchema(json.schema) } } : {}),
+    };
+    delete settings.output_config;
     const res = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
         body: JSON.stringify({
             model,
-            max_tokens: args.maxTokens ?? 1024,
             system: args.system,
             messages: args.messages,
-            ...(args.temperature !== undefined ? { temperature: args.temperature } : {}),
-            ...(tool
-                ? {
-                    tools: [{ name: tool.name, description: tool.description ?? tool.name, input_schema: tool.schema }],
-                    tool_choice: { type: "tool", name: tool.name },
-                }
-                : {}),
+            ...settings,
+            ...(Object.keys(outputConfig).length ? { output_config: outputConfig } : {}),
         }),
     });
     const body = (await res.json().catch(() => ({})));
     if (!res.ok)
         throw new Error(`anthropic ${res.status}: ${body.error?.message ?? "request failed"}`);
+    if (body.stop_reason === "refusal")
+        throw new Error(`anthropic declined the request (${model})`);
+    if (body.stop_reason === "max_tokens")
+        throw new Error(`anthropic answer cut off at max_tokens (${model})`);
     const usage = { input_tokens: body.usage?.input_tokens, output_tokens: body.usage?.output_tokens };
-    if (tool) {
-        const block = body.content?.find((b) => b.type === "tool_use" && b.name === tool.name);
-        if (!block)
-            throw new Error(`anthropic returned no ${tool.name} tool call (${model})`);
-        return { text: JSON.stringify(block.input), usage, toolInput: block.input };
-    }
     const text = (body.content ?? []).filter((b) => b.type === "text").map((b) => b.text ?? "").join("").trim();
     if (!text)
         throw new Error(`anthropic returned no text (${model})`);
@@ -218,19 +253,15 @@ export async function chat(args) {
 }
 /** Structured answer matching a JSON Schema. A leg whose output does not parse fails over to the next. */
 export async function chatJson(args) {
-    const spec = { schema: args.schema, name: args.schemaName, description: args.schemaDescription };
+    const spec = { schema: args.schema, name: args.schemaName };
     const { out, leg, fellBack, latencyMs } = await runLegs(args, async (l) => {
-        if (l.provider === "anthropic") {
-            const r = await callAnthropic(l.model, args, spec);
-            return { ...r, data: r.toolInput };
-        }
-        const r = await callWorkersAi(l.model, args, spec);
+        const r = l.provider === "anthropic" ? await callAnthropic(l.model, args, spec) : await callWorkersAi(l.model, args, spec);
         let data;
         try {
             data = JSON.parse(r.text);
         }
         catch {
-            throw new Error(`workers-ai returned invalid JSON (${l.model})`);
+            throw new Error(`${l.provider} returned invalid JSON (${l.model})`);
         }
         return { ...r, data };
     });

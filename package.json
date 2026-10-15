@@ -1,6 +1,6 @@
 {
   "name": "@lfiq/lfiq-llm",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "LFIQ router for Pursue, Watch, Parcel, Home and Website: Workers AI first, then the Anthropic API. Never OCP. Callers name a task key and a tier, never a model id.",
   "type": "module",
   "main": "./dist/llm.js",

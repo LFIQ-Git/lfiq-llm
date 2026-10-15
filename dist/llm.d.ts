@@ -44,11 +44,10 @@ export interface ChatArgs {
     timeoutMs?: number;
 }
 export interface JsonArgs extends ChatArgs {
-    /** JSON Schema the answer must match. Sent as a forced tool (Anthropic) or json_schema (Workers AI). */
+    /** JSON Schema the answer must match. Sent as structured output (output_config.format on Anthropic, response_format on Workers AI). */
     schema: Record<string, unknown>;
-    /** Name for the schema / tool, e.g. "record_study". */
+    /** Name for the schema, e.g. "record_study". */
     schemaName: string;
-    schemaDescription?: string;
 }
 export interface Usage {
     input_tokens?: number;
@@ -96,6 +95,17 @@ export declare function parseRoute(spec: string): RouteLeg[];
 export declare function resolveRoute(task: string, tier: Tier): RouteLeg[];
 /** True when this task has at least one usable leg right now. */
 export declare function llmConfigured(task?: string, tier?: Tier): boolean;
+/**
+ * Per-model request settings. Thinking tokens count against max_tokens, so a
+ * model that thinks by default needs thinking off or extra room, or the answer
+ * is cut short.
+ *   - claude-haiku-4-*: no thinking by default; sampling settings allowed.
+ *   - claude-sonnet-5-5: thinks by default; `between_tools` turns it off.
+ *   - other current models (Opus 5.5 etc.): thinking always on; low effort plus headroom.
+ */
+export declare function anthropicSettings(model: string, maxTokens: number, temperature?: number): Record<string, unknown>;
+/** Structured outputs need additionalProperties: false on every object. */
+export declare function strictSchema(schema: unknown): unknown;
 /** Free-text answer. */
 export declare function chat(args: ChatArgs): Promise<ChatResult>;
 /** Structured answer matching a JSON Schema. A leg whose output does not parse fails over to the next. */

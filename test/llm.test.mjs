@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import {
   ROUTES,
+  anthropicSettings,
   chat,
   chatJson,
   llmConfigured,
@@ -127,14 +128,51 @@ test("task keys must be app.task", async () => {
   await assert.rejects(chat({ ...ARGS, task: "blurb" }), /app\.task/);
 });
 
-test("chatJson forces the tool on Anthropic and returns its input", async () => {
+test("chatJson uses structured output on Anthropic, never a forced tool", async () => {
   process.env.ANTHROPIC_API_KEY = "sk-test-0000000000";
-  anthropicReply({ content: [{ type: "tool_use", name: "record_study", input: { summary: "ok" } }], usage: {} });
-  const schema = { type: "object", properties: { summary: { type: "string" } }, required: ["summary"] };
+  anthropicReply({ content: [{ type: "text", text: '{"summary":"ok","people":[{"name":"A"}]}' }], stop_reason: "end_turn", usage: {} });
+  const schema = { type: "object", properties: { summary: { type: "string" }, people: { type: "array", items: { type: "object", properties: { name: { type: "string" } } } } }, required: ["summary"] };
   const r = await chatJson({ ...ARGS, task: "pursue.competitor_study", tier: "standard", schema, schemaName: "record_study" });
-  assert.deepEqual(r.data, { summary: "ok" });
-  assert.deepEqual(anthropicCalls[0].body.tool_choice, { type: "tool", name: "record_study" });
-  assert.equal(anthropicCalls[0].body.model, "claude-sonnet-5-5");
+  assert.deepEqual(r.data, { summary: "ok", people: [{ name: "A" }] });
+  const body = anthropicCalls[0].body;
+  assert.equal(body.tool_choice, undefined);
+  assert.equal(body.tools, undefined);
+  assert.equal(body.output_config.format.type, "json_schema");
+  assert.equal(body.output_config.format.schema.additionalProperties, false);
+  assert.equal(body.output_config.format.schema.properties.people.items.additionalProperties, false);
+  assert.deepEqual(body.thinking, { type: "between_tools" });
+});
+
+test("Sonnet 5.5 runs without thinking and without sampling settings; Haiku 4.5 keeps temperature", () => {
+  assert.deepEqual(anthropicSettings("claude-sonnet-5-5", 900, 0.2), { max_tokens: 900, thinking: { type: "between_tools" } });
+  assert.deepEqual(anthropicSettings("claude-haiku-4-5", 100, 0.2), { max_tokens: 100, temperature: 0.2 });
+  const opus = anthropicSettings("claude-opus-5-5", 900);
+  assert.ok(opus.max_tokens > 900);
+  assert.deepEqual(opus.output_config, { effort: "low" });
+  assert.equal(opus.thinking, undefined);
+});
+
+test("an answer cut off at max_tokens fails instead of returning partial text", async () => {
+  process.env.ANTHROPIC_API_KEY = "sk-test-0000000000";
+  anthropicReply({ content: [{ type: "text", text: "## Ranking\nAt 96/100 the" }], stop_reason: "max_tokens", usage: { output_tokens: 900 } });
+  await assert.rejects(chat({ ...ARGS, task: "pursue.brief", tier: "standard", maxTokens: 900 }), /cut off at max_tokens/);
+  assert.equal(runs[0].ok, false);
+});
+
+test("a refusal fails over instead of returning empty text", async () => {
+  process.env.AI_ROUTE_PURSUE_BRIEF = "anthropic:claude-sonnet-5-5,anthropic:claude-haiku-4-5";
+  process.env.ANTHROPIC_API_KEY = "sk-test-0000000000";
+  let n = 0;
+  globalThis.fetch = async (url, init) => {
+    anthropicCalls.push({ body: JSON.parse(init.body) });
+    const body = n++ === 0
+      ? { content: [], stop_reason: "refusal", usage: {} }
+      : { content: [{ type: "text", text: "Answer." }], stop_reason: "end_turn", usage: {} };
+    return new Response(JSON.stringify(body), { status: 200 });
+  };
+  const r = await chat({ ...ARGS, task: "pursue.brief", tier: "standard" });
+  assert.equal(r.model, "claude-haiku-4-5");
+  assert.equal(anthropicCalls[1].body.thinking, undefined, "router drops between_tools when it moves to another model");
 });
 
 test("chatJson on Workers AI sends json_schema and fails over on unparseable output", async () => {
@@ -142,7 +180,7 @@ test("chatJson on Workers AI sends json_schema and fails over on unparseable out
   const ai = aiBinding({ choices: [{ message: { content: "not json" } }] });
   setWorkersAi(ai);
   process.env.ANTHROPIC_API_KEY = "sk-test-0000000000";
-  anthropicReply({ content: [{ type: "tool_use", name: "record_study", input: { summary: "paid" } }], usage: {} });
+  anthropicReply({ content: [{ type: "text", text: '{"summary":"paid"}' }], stop_reason: "end_turn", usage: {} });
   const schema = { type: "object", properties: { summary: { type: "string" } }, required: ["summary"] };
   const r = await chatJson({ ...ARGS, task: "pursue.competitor_study", tier: "standard", schema, schemaName: "record_study" });
   assert.equal(ai.calls[0].input.response_format.type, "json_schema");

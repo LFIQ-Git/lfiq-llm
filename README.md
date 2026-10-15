@@ -37,10 +37,22 @@ Only `workers-ai` and `anthropic` are accepted as providers.
 
 `chatJson({ ..., schema, schemaName })` returns `data` that matches the schema:
 
-- **Anthropic:** the schema is sent as a forced tool call.
+- **Anthropic:** structured output (`output_config.format`). The router adds `additionalProperties: false` to every object in the schema.
 - **Workers AI:** the schema is sent as `response_format: json_schema`.
 
-If a leg returns output that doesn't parse, the router moves on to the next leg.
+If a leg returns JSON that doesn't parse, the router moves on to the next leg.
+
+## Model settings
+
+Thinking tokens count against `max_tokens`, so the router sets each model up so the answer isn't cut short:
+
+| Model | Settings |
+|---|---|
+| `claude-haiku-4-5` | No thinking. Temperature is passed through. |
+| `claude-sonnet-5-5` | `thinking: between_tools`, which turns thinking off. Sampling settings aren't sent (Sonnet 5.5 rejects them). |
+| Other current models | Low effort, plus 4,096 tokens of headroom |
+
+An answer that stops at `max_tokens`, or a refusal, counts as a failed leg. The next leg runs instead of the call returning partial text.
 
 ## Logging
 
