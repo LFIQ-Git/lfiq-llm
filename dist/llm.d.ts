@@ -5,7 +5,8 @@
  *   - "workers-ai" — Cloudflare Workers AI through the calling Worker's own `AI`
  *                    binding (register it with setWorkersAi). Free up to the
  *                    account's daily Neuron allowance.
- *   - "anthropic"  — the Anthropic Messages API (ANTHROPIC_API_KEY). Paid.
+ *   - "anthropic"  — the Anthropic Messages API, through the Cloudflare AI Gateway when
+ *                    AI_GATEWAY_TOKEN is set, else directly with ANTHROPIC_API_KEY. Paid.
  *
  * LFIQ apps never use OCP (decided 2026-10-07). This package has no OCP code
  * path and reads no OCP setting.
@@ -99,6 +100,10 @@ export declare function resolveRoute(task: string, tier: Tier): Promise<RouteLeg
 export declare function flushRuns(): Promise<void>;
 /** True when this task has at least one usable leg right now. */
 export declare function llmConfigured(task?: string, tier?: Tier): boolean;
+/** The Left Field Cloudflare AI Gateway's Anthropic endpoint (gateway "default"). */
+export declare const DEFAULT_AI_GATEWAY_URL = "https://gateway.ai.cloudflare.com/v1/c16c7246ee0a89e6deafe19a74480c6a/default/anthropic";
+/** True when the Anthropic leg can run: through the AI Gateway, or directly with a key. */
+export declare function anthropicConfigured(): boolean;
 /**
  * Per-model request settings. Thinking tokens count against max_tokens, so a
  * model that thinks by default needs thinking off or extra room, or the answer
