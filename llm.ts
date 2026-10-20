@@ -5,7 +5,8 @@
  *   - "workers-ai" — Cloudflare Workers AI through the calling Worker's own `AI`
  *                    binding (register it with setWorkersAi). Free up to the
  *                    account's daily Neuron allowance.
- *   - "anthropic"  — the Anthropic Messages API (ANTHROPIC_API_KEY). Paid.
+ *   - "anthropic"  — the Anthropic Messages API, through the Cloudflare AI Gateway when
+ *                    AI_GATEWAY_TOKEN is set, else directly with ANTHROPIC_API_KEY. Paid.
  *
  * LFIQ apps never use OCP (decided 2026-10-07). This package has no OCP code
  * path and reads no OCP setting.
@@ -256,7 +257,32 @@ export function llmConfigured(task = "", tier: Tier = "fast"): boolean {
 
 function legAvailable(leg: RouteLeg): boolean {
   if (leg.provider === "workers-ai") return Boolean(G[AI_KEY]);
-  return Boolean(env("ANTHROPIC_API_KEY"));
+  return anthropicConfigured();
+}
+
+/** The Left Field Cloudflare AI Gateway's Anthropic endpoint (gateway "default"). */
+export const DEFAULT_AI_GATEWAY_URL =
+  "https://gateway.ai.cloudflare.com/v1/c16c7246ee0a89e6deafe19a74480c6a/default/anthropic";
+
+/** True when the Anthropic leg can run: through the AI Gateway, or directly with a key. */
+export function anthropicConfigured(): boolean {
+  return Boolean(env("AI_GATEWAY_TOKEN")?.trim() || env("ANTHROPIC_API_KEY"));
+}
+
+/**
+ * Where the Anthropic leg sends its call. With AI_GATEWAY_TOKEN set it goes through the
+ * Cloudflare AI Gateway with no Anthropic key, so the gateway's stored key, logs and spend
+ * limit apply; otherwise directly with ANTHROPIC_API_KEY. Env: AI_GATEWAY_TOKEN, AI_GATEWAY_URL.
+ */
+function anthropicTarget(): { url: string; auth: Record<string, string> } {
+  const token = env("AI_GATEWAY_TOKEN")?.trim();
+  if (token) {
+    const base = (env("AI_GATEWAY_URL")?.trim() || DEFAULT_AI_GATEWAY_URL).replace(/\/$/, "");
+    return { url: `${base}/v1/messages`, auth: { "cf-aig-authorization": `Bearer ${token}` } };
+  }
+  const key = env("ANTHROPIC_API_KEY");
+  if (!key) throw new Error("Neither AI_GATEWAY_TOKEN nor ANTHROPIC_API_KEY is set");
+  return { url: "https://api.anthropic.com/v1/messages", auth: { "x-api-key": key } };
 }
 
 /* --------------------------------------------------------------- providers */
@@ -362,17 +388,16 @@ async function callAnthropic(
   args: ChatArgs,
   json?: { schema: Record<string, unknown> },
 ): Promise<LegOutput> {
-  const key = env("ANTHROPIC_API_KEY");
-  if (!key) throw new Error("ANTHROPIC_API_KEY not set");
+  const target = anthropicTarget();
   const settings = anthropicSettings(model, args.maxTokens ?? 1024, args.temperature);
   const outputConfig = {
     ...((settings.output_config as Record<string, unknown> | undefined) ?? {}),
     ...(json ? { format: { type: "json_schema", schema: strictSchema(json.schema) } } : {}),
   };
   delete settings.output_config;
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+  const res = await fetch(target.url, {
     method: "POST",
-    headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+    headers: { ...target.auth, "anthropic-version": "2023-06-01", "content-type": "application/json" },
     body: JSON.stringify({
       model,
       system: args.system,
